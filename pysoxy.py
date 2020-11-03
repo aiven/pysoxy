@@ -4,6 +4,8 @@
  from https://github.com/MisterDaneel/
 """
 
+# Config
+import argparse
 # Network
 import socket
 import select
@@ -11,18 +13,31 @@ from struct import pack, unpack
 # System
 import traceback
 from threading import Thread, activeCount
+import requests
 from signal import signal, SIGINT, SIGTERM
 from time import sleep
 import sys
-
+import json
 #
 # Configuration
 #
+parser = argparse.ArgumentParser(description="Process server params")
+parser.add_argument("--port", default=1080, help="Port to bind the server to")
+parser.add_argument("--host", default="0.0.0.0", help="Interface to bind the server to")
+parser.add_argument("--username", default=None, help="Username for user/pass auth")
+parser.add_argument("--password", default=None, help="Password for user/pass auth")
+parser.add_argument("--authenticator", default=None, help="External authenticator URL")
+parser.add_argument("--cafile", default=None, help="External authenticator cert file")
+args = parser.parse_args()
 MAX_THREADS = 200
 BUFSIZE = 2048
 TIMEOUT_SOCKET = 5
-LOCAL_ADDR = '0.0.0.0'
-LOCAL_PORT = 9050
+LOCAL_ADDR = args.host
+LOCAL_PORT = args.port
+USERNAME = args.username
+PASSWORD = args.password
+AUTHENTICATOR_URL = args.authenticator
+CA_FILE = args.cafile
 # Parameter to bind a socket to a device, using SO_BINDTODEVICE
 # Only root can set this option
 # If the name is an empty string or None, the interface is chosen when
@@ -39,6 +54,8 @@ VER = b'\x05'
 '''Method constants'''
 # '00' NO AUTHENTICATION REQUIRED
 M_NOAUTH = b'\x00'
+# '02' USER/PASS AUTHENTICATION REQUIRED
+M_USER_AUTH = b'\x02'
 # 'FF' NO ACCEPTABLE METHODS
 M_NOTAVAILABLE = b'\xff'
 '''Command constants'''
@@ -49,6 +66,8 @@ CMD_CONNECT = b'\x01'
 ATYP_IPV4 = b'\x01'
 # DOMAINNAME '03'
 ATYP_DOMAINNAME = b'\x03'
+# IP V6 address
+ATYP_IPV6 = b'\x04'
 
 
 class ExitStatus:
@@ -142,12 +161,18 @@ def request_client(wrapper):
     if s5_request[3:4] == ATYP_IPV4:
         dst_addr = socket.inet_ntoa(s5_request[4:-2])
         dst_port = unpack('>H', s5_request[8:len(s5_request)])[0]
+    # IPV6
+    # socket.inet_ntoa()
+    # elif s5_request[3:4] == ATYP_IPV6:
+    #     pass
     # DOMAIN NAME
     elif s5_request[3:4] == ATYP_DOMAINNAME:
         sz_domain_name = s5_request[4]
         dst_addr = s5_request[5: 5 + sz_domain_name - len(s5_request)]
         port_to_unpack = s5_request[5 + sz_domain_name:len(s5_request)]
         dst_port = unpack('>H', port_to_unpack)[0]
+    elif s5_request[3:4] == ATYP_IPV6:
+        pass
     else:
         return False
     print(dst_addr, dst_port)
@@ -203,6 +228,7 @@ def subnegotiation_client(wrapper):
     # +----+----------+----------+
     try:
         identification_packet = wrapper.recv(BUFSIZE)
+        print(f"first package: {identification_packet}")
     except socket.error:
         error()
         return M_NOTAVAILABLE
@@ -215,8 +241,8 @@ def subnegotiation_client(wrapper):
     if len(methods) != nmethods:
         return M_NOTAVAILABLE
     for method in methods:
-        if method == ord(M_NOAUTH):
-            return M_NOAUTH
+        if method == ord(M_USER_AUTH):
+            return M_USER_AUTH
     return M_NOTAVAILABLE
 
 
@@ -225,14 +251,19 @@ def subnegotiation(wrapper):
         The client connects to the server, and sends a version
         identifier/method selection message
         The server selects from one of the methods given in METHODS, and
-        sends a METHOD selection message
+        sends a METHOD selection message, then follows the steps required
+        for the auth method to succeed
     """
     method = subnegotiation_client(wrapper)
+    print(f"Using method {method}")
     # Server Method selection message
+    #
+    # Reply
     # +----+--------+
     # |VER | METHOD |
     # +----+--------+
-    if method != M_NOAUTH:
+    if method != M_USER_AUTH:
+        print(f"Invalid method: {method}")
         return False
     reply = VER + method
     try:
@@ -240,6 +271,49 @@ def subnegotiation(wrapper):
     except socket.error:
         error()
         return False
+    failed_auth_reply = b"\x01\x01"
+    success_auth_reply = b"\x01\x00"
+    try:
+        version, = unpack("B", wrapper.recv(1))
+        if version != 1:
+            wrapper.sendall(failed_auth_reply)
+            print("Invalid version byte")
+            return False
+        user_len, = unpack("B", wrapper.recv(1))
+        user = wrapper.recv(int(user_len)).decode()
+        pass_len, = unpack("B", wrapper.recv(1))
+        password = wrapper.recv(int(pass_len)).decode()
+        if user_len != len(user) or pass_len != len(password):
+            wrapper.sendall(failed_auth_reply)
+            print("Invalid user / pass len")
+            return False
+        if AUTHENTICATOR_URL is not None:
+            payload = {
+                "type": "aiven_proxy_authorization_v1",
+                "username": user,
+                "password": password,
+            }
+            resp = requests.post(AUTHENTICATOR_URL, json=payload, verify=False if not CA_FILE else CA_FILE)
+            if not resp.ok:
+                wrapper.sendall(failed_auth_reply)
+                return False
+            try:
+                data = resp.json()
+                if "decision" not in data or data["decision"] != "authenticated":
+                    wrapper.sendall(failed_auth_reply)
+                    return False
+            except json.JSONDecodeError:
+                wrapper.sendall(failed_auth_reply)
+                return False
+        elif user != USERNAME or password != PASSWORD:
+            print("Invalid user / pass")
+            wrapper.sendall(failed_auth_reply)
+            return False
+    except socket.error:
+        error()
+        return False
+    print("Auth successful")
+    wrapper.sendall(success_auth_reply)
     return True
 
 
